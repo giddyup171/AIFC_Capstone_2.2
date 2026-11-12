@@ -422,7 +422,7 @@ class HousePricePreprocessor:
         self.pipeline = build_preprocessor(self.config)
         self.is_fitted = False
 
-    def fit(self, X: pd.DataFrame, y=None) -> "HousePricePreprocessor":
+    def fit(self, X: pd.DataFrame, y=None) -> HousePricePreprocessor:
         self.pipeline.fit(X)
         self.is_fitted = True
         return self
@@ -469,5 +469,5 @@ class HousePricePreprocessor:
         return path
 
     @staticmethod
-    def load(path: str | Path) -> "HousePricePreprocessor":
+    def load(path: str | Path) -> HousePricePreprocessor:
         return joblib.load(path)

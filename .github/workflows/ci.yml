@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Lint (ruff)
+        run: ruff check .
+      - name: Type check (mypy, feature-engineering layer)
+        run: mypy
+      - name: Unit tests (pytest)
+        run: python -m pytest -v
+      - name: Validate the feature-engineering config
+        run: python -c "from src.fe_config import load_fe_config; load_fe_config('configs/feature_engineering.yaml'); print('config OK')"

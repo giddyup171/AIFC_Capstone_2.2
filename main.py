@@ -69,23 +69,6 @@ import numpy as np
 import pandas as pd
 from sklearn.base import clone
 
-from src.models import (
-    BASELINE_DESCRIPTIONS,
-    compare_models,
-    cross_validate_models,
-    evaluate_on_test,
-    get_baseline_models,
-    linear_coefficients,
-    make_cv_splits,
-    plot_cv_comparison,
-    plot_diagnostics,
-    price_band_metrics,
-    regression_metrics,
-    save_benchmark,
-    save_model,
-    segment_metrics,
-    summarise_cv,
-)
 from src.advanced_models import (
     ADVANCED_DESCRIPTIONS,
     get_advanced_models,
@@ -97,6 +80,17 @@ from src.advanced_models import (
     plot_segment_bias,
     timing_table,
     tune_model,
+)
+from src.fe_config import FEConfigError, load_fe_config
+from src.feature_engineering import catalogue_table
+from src.feature_selection import (
+    _model_for,
+    candidate_sets,
+    choose_feature_set,
+    compare_feature_sets,
+    plot_feature_set_comparison,
+    plot_selection,
+    selection_table,
 )
 from src.model_optimization import (
     SELECTION_RULE,
@@ -113,17 +107,24 @@ from src.model_optimization import (
     tune_candidate,
     validation_curve_table,
 )
-from src.feature_engineering import (
-    FEATURE_CATALOGUE,
-    candidate_sets,
-    choose_feature_set,
-    compare_feature_sets,
-    make_fe_model,
-    plot_feature_set_comparison,
-    plot_selection,
-    selection_table,
+from src.models import (
+    BASELINE_DESCRIPTIONS,
+    compare_models,
+    cross_validate_models,
+    evaluate_on_test,
+    get_baseline_models,
+    linear_coefficients,
+    make_cv_splits,
+    make_model,
+    plot_cv_comparison,
+    plot_diagnostics,
+    price_band_metrics,
+    regression_metrics,
+    save_benchmark,
+    save_model,
+    segment_metrics,
+    summarise_cv,
 )
-from src.models import make_model
 from src.preprocessing import (
     HousePricePreprocessor,
     PreprocessingConfig,
@@ -132,6 +133,7 @@ from src.preprocessing import (
     load_data,
     split_data,
 )
+from src.profiling import Profiler, cprofile_call
 
 logger = logging.getLogger("main")
 
@@ -153,6 +155,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--drop-features", nargs="*", default=[], help="Features to exclude")
     p.add_argument("--cv-folds", type=int, default=5)
     p.add_argument("--cv-repeats", type=int, default=3)
+    p.add_argument("--fe-config", default="configs/feature_engineering.yaml",
+                   help="Feature engineering & selection config (YAML)")
     p.add_argument("--n-iter", type=int, default=20, help="Random-search trials per advanced model")
     p.add_argument("--skip-nested", action="store_true", help="Skip nested CV for advanced models")
     p.add_argument("--no-robustness-check", action="store_true", help="Skip the corrupted-data check")
@@ -240,26 +244,36 @@ def run_preprocessing(args, config: PreprocessingConfig, out: Path) -> dict:
 def run_features(args, config: PreprocessingConfig, data: dict, out: Path) -> dict:
     from sklearn.linear_model import RidgeCV
 
+    try:
+        fe = load_fe_config(args.fe_config)
+    except FEConfigError as e:
+        raise SystemExit(f"Feature-engineering configuration error: {e}") from e
     X_train, X_test, y_train, y_test = data["X_train"], data["X_test"], data["y_train"], data["y_test"]
     fdir = out / "features"
     fdir.mkdir(parents=True, exist_ok=True)
+    (fdir / "fe_config_used.json").write_text(json.dumps(fe.to_dict(), indent=2))
+    prof = Profiler(enabled=fe.profiling.enabled, track_memory=fe.profiling.track_memory)
     splits = make_cv_splits(X_train, args.cv_folds, args.cv_repeats, args.seed)
 
-    catalogue = pd.DataFrame([{"feature": n, "formula": f.description, "type": f.kind, "logged": f.log,
-                               "domain_rationale": f.rationale} for n, f in FEATURE_CATALOGUE.items()])
-    catalogue.to_csv(fdir / "engineered_feature_catalogue.csv", index=False)
-    logger.info("Engineered %d candidate features: %s", len(catalogue), list(FEATURE_CATALOGUE))
+    catalogue_table(fe).to_csv(fdir / "engineered_feature_catalogue.csv", index=False)
+    logger.info("Domain features enabled: %s", fe.domain.features)
+    if not fe.temporal.date_columns:
+        logger.info("Temporal features: no date columns configured (this dataset has none); generator is a no-op")
 
-    logger.info("Scoring features: mutual information, redundancy, Lasso stability, RFECV, permutation importance")
-    table, redundant, n_rfe = selection_table(config, X_train, y_train, splits, args.seed)
+    if fe.profiling.cprofile_top:
+        (table, redundant, n_rfe), report = cprofile_call(selection_table, config, fe, X_train, y_train, splits,
+                                                          args.seed, prof, top=fe.profiling.cprofile_top)
+        (fdir / "cprofile_selection.txt").write_text(report)
+    else:
+        table, redundant, n_rfe = selection_table(config, fe, X_train, y_train, splits, args.seed, prof)
     table.to_csv(fdir / "feature_selection_scores.csv")
     redundant.to_csv(fdir / "redundant_pairs.csv", index=False)
     plot_selection(table, fdir / "feature_selection_votes.png")
 
-    sets = candidate_sets(table, config)
+    sets = candidate_sets(table, config, fe)
     logger.info("Comparing %d candidate feature sets on %d paired folds", len(sets), len(splits))
-    folds = compare_feature_sets(sets, config, X_train, y_train, splits, args.seed)
-    chosen, comparison, note = choose_feature_set(folds, sets, config)
+    folds = compare_feature_sets(sets, config, fe, X_train, y_train, splits, args.seed, prof)
+    chosen, comparison, note = choose_feature_set(folds, sets, config, fe)
     folds.to_csv(fdir / "feature_set_cv_folds.csv", index=False)
     comparison.to_csv(fdir / "feature_set_comparison.csv")
     plot_feature_set_comparison(folds, chosen, fdir / "feature_set_comparison.png")
@@ -267,27 +281,30 @@ def run_features(args, config: PreprocessingConfig, data: dict, out: Path) -> di
     gb = folds[folds.model.str.startswith("gboost|")].groupby("model").rmse.mean()
     gb_gain = 1 - gb["gboost|original_plus_all_engineered"] / gb["gboost|original"] if len(gb) == 2 else None
 
-    # Confirm once on the held-out test set (original vs chosen), Ridge benchmark
-    test_rows = {}
-    for name in dict.fromkeys(["original", chosen]):
-        m = make_fe_model(RidgeCV(alphas=np.logspace(-3, 3, 25)), config, sets[name]["engineered"],
-                          sets[name]["drop"]).fit(X_train, y_train)
-        test_rows[name] = regression_metrics(y_test, m.predict(X_test))
+    with prof.step("test-set confirmation"):
+        test_rows = {}
+        for name in dict.fromkeys(["original", chosen]):
+            m = _model_for(RidgeCV(alphas=np.logspace(-3, 3, 25)), config, fe, sets[name], args.seed)
+            test_rows[name] = regression_metrics(y_test, m.fit(X_train, y_train).predict(X_test))
     test = pd.DataFrame(test_rows).T
     test.to_csv(fdir / "feature_set_test.csv")
+    profile = prof.table()
+    if not profile.empty:
+        profile.to_csv(fdir / "profile.csv", index=False)
 
     result = {"selected_feature_set": chosen, "decision": note, "engineered": sets[chosen]["engineered"],
-              "dropped": sets[chosen]["drop"], "rfecv_optimal_n_columns": n_rfe,
-              "candidate_sets": sets, "gradient_boosting_gain_all_engineered": gb_gain,
-              "rule": "Must beat the original features on the 15 paired folds (p < 0.05) by >= 0.5% RMSE; "
-                      "among qualifying sets within 0.5% of the best, the one with the fewest features wins.",
-              "test": test.round(4).to_dict(orient="index")}
+              "dropped": sets[chosen]["drop"], "overrides": sets[chosen]["overrides"],
+              "rfecv_optimal_n_columns": n_rfe, "candidate_sets": sets,
+              "gradient_boosting_gain_all_engineered": gb_gain,
+              "rule": {"alpha": fe.decision.alpha, "min_gain": fe.decision.min_gain,
+                       "tie_tolerance": fe.decision.tie_tolerance},
+              "test": test.round(4).to_dict(orient="index"), "config": args.fe_config}
     (fdir / "selected_features.json").write_text(json.dumps(result, indent=2, default=str))
 
     pd.set_option("display.width", 200)
     print("\nFEATURE SELECTION (votes to keep, of 5)\n" + table[["engineered", "mutual_info", "lasso_keep_share",
           "rfecv_rank", "permutation_rmse_increase", "votes"]].round(4).to_string())
-    print("\nFEATURE SETS (Ridge benchmark, 15 paired folds)\n" + comparison.to_string(
+    print("\nFEATURE SETS (Ridge benchmark, 15 paired folds)\n" + comparison.sort_values("cv_rmse").to_string(
         formatters={"cv_rmse": "${:,.0f}".format, "gain_vs_original": "{:.1%}".format,
                     "p_value": lambda v: "-" if pd.isna(v) else f"{v:.2g}"}))
     if gb_gain is not None:
@@ -295,6 +312,9 @@ def run_features(args, config: PreprocessingConfig, data: dict, out: Path) -> di
     print("\nTEST SET (Ridge benchmark)\n" + test[["rmse", "mae", "mape", "r2"]].to_string(
         formatters={"rmse": "${:,.0f}".format, "mae": "${:,.0f}".format, "mape": "{:.2%}".format,
                     "r2": "{:.3f}".format}))
+    if not profile.empty:
+        print("\nPROFILE (feature engineering stage)\n" + profile[["step", "wall_seconds", "cpu_seconds",
+              "peak_memory_mb", "share_of_wall"]].round(3).to_string(index=False))
     print(f"\nSELECTED FEATURE SET: {note}")
     logger.info("Saved feature engineering results to %s/", fdir)
     return result
@@ -540,7 +560,8 @@ def run_optimize(args, config: PreprocessingConfig, data: dict, base: dict, adv:
 
     # 20. Diagnostics
     every = {BENCHMARK_MODEL: ridge, "ridge_splines": optimised["ridge_splines"],
-             "gradient_boosting": stage4["gradient_boosting"], "gradient_boosting_opt": optimised["gradient_boosting_opt"],
+             "gradient_boosting": stage4["gradient_boosting"],
+             "gradient_boosting_opt": optimised["gradient_boosting_opt"],
              "neural_network": stage4["neural_network"], "neural_network_opt": optimised["neural_network_opt"]}
     diag = fit_diagnosis_table(every, X_train, y_train, outer)
 

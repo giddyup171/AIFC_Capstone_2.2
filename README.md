@@ -5,9 +5,11 @@ A **regression** project: predicting `house_sale_price` from property and neighb
 - **Stage 1 — EDA** (`eda.ipynb`): understand the data and decide how to prepare it.
 - **Stage 2 — Preprocessing pipeline** (`src/preprocessing.py`, `main.py`): a modular, reusable scikit-learn pipeline that
   implements those decisions for missing values, outliers, transformation, encoding and scaling.
-- **Stage 2b — Feature engineering** (`src/feature_engineering.py`, `main.py --stage features`): nine domain-driven
-  features, five feature-selection techniques and a paired-CV comparison of feature sets. **Selected set: RFECV**
-  (original features + 5 engineered), CV RMSE −9.0% for the Ridge benchmark.
+- **Stage 2b — Feature engineering** (`src/feature_engineering.py`, `src/feature_selection.py`,
+  `configs/feature_engineering.yaml`, `main.py --stage features`): nine domain features plus configurable generic
+  generators, encoders and imputation options; five feature-selection techniques with configurable thresholds; a
+  paired-CV comparison of 14 feature sets; 65 unit tests, lint, type checks and CI. **Selected set: RFECV** (original
+  features + 5 engineered), CV RMSE −9.0% for the Ridge benchmark.
 - **Stage 3 — Baseline model** (`src/models.py`, `main.py`): a ladder of baseline models, a shared evaluation framework
   and a saved benchmark (`benchmark.json`) that every later model must beat.
 - **Stage 4 — Advanced models** (`src/advanced_models.py`, `main.py`): gradient boosting and a neural network, tuned and
@@ -26,13 +28,23 @@ AIFC_Capstone/
 ├── README.md                 # This file: setup, EDA findings, pipeline docs
 ├── eda.ipynb                 # Full EDA notebook (executed, outputs included)
 ├── requirements.txt          # Python dependencies
-├── main.py                   # Runs preprocessing + baseline modelling end to end (CLI)
+├── requirements-dev.txt      # Tooling: pytest, ruff, mypy, pre-commit
+├── pyproject.toml            # pytest, ruff and mypy configuration
+├── .pre-commit-config.yaml   # ruff + mypy + pytest on every commit
+├── .github/workflows/ci.yml  # CI: lint, type check, tests, config validation on every push
+├── main.py                   # Runs every stage end to end (CLI)
+├── configs/
+│   └── feature_engineering.yaml  # Every feature-engineering & selection threshold (Stage 2b)
 ├── src/
 │   ├── preprocessing.py      # Reusable preprocessing module (config, transformers, pipeline)
-│   ├── feature_engineering.py # Domain features, feature selection, feature-set comparison
+│   ├── fe_config.py          # Typed, validated feature-engineering configuration
+│   ├── feature_engineering.py # Domain features, generic generators, encoders, temporal design, pipeline
+│   ├── feature_selection.py  # Five selection techniques, candidate sets, comparison, decision rule
+│   ├── profiling.py          # Step-level wall/CPU time and peak memory
 │   ├── models.py             # Baseline models, metrics, CV, model comparison, benchmark
 │   ├── advanced_models.py    # Gradient boosting + neural network, tuning, nested CV, analysis
 │   └── model_optimization.py # CV strategies, tuning, over/under-fitting fixes, final model selection
+├── tests/                    # 65 pytest tests for the feature-engineering layer
 ├── docs/                     # Plots shown in this README
 └── synthetic_data_208.csv    # Dataset (1,000 rows × 9 columns)
 ```
@@ -216,56 +228,138 @@ noisier future data, where the robustness check shows they matter.
 
 ## Feature engineering (Stage 2b)
 
-Run on its own with `python main.py --stage features` (about 30 seconds); it is also part of `python main.py`.
+```bash
+python main.py --stage features                                    # ~25 s (parallel CV)
+python main.py --stage features --fe-config my_experiment.yaml     # any variation, no code changes
+python -m pytest                                                   # 65 tests, ~8 s
+```
 
-### Engineered features and their domain rationale
+### Design overview
 
-`DomainFeatureEngineer` builds these **inside** the scikit-learn pipeline (after validation, before imputation), so they
-are recomputed identically for new data and re-fitted in every CV fold with no leakage.
+```
+temporal  -> TemporalFeatureGenerator  (no-op here: the dataset has no dates; see "Temporal features")
+validate  -> DomainValidator           (Stage 2 rules)
+engineer  -> DomainFeatureEngineer     (named domain features)
+columns   -> num : impute (median|mean|knn) -> transform (log|yeo-johnson|box-cox|none)
+                   -> cap outliers -> GenericFeatureGenerator (interactions|polynomial|binning) -> scale
+             miss: MissingIndicator    (optional; 0/1 flags bypass outlier capping)
+             bin : impute              (0/1 domain flags bypass outlier capping)
+             cat : impute -> encode    (onehot|frequency|target|hash)
+```
+
+Every step is a scikit-learn transformer inside one pipeline, so it is fitted on training data only, re-fitted within
+every CV fold (no leakage), and applied identically to new data.
+
+### Configuration: every decision lives in `configs/feature_engineering.yaml`
+
+`src/fe_config.py` defines typed dataclasses with documented defaults, loads the YAML and **validates every value**
+(ranges, allowed options, unknown keys), failing with a clear message such as
+`selection.lasso_keep_share must be a number between 0.0 and 1.0`. The shipped YAML equals the defaults (a test
+enforces this), so the reference run is reproducible.
+
+| Section | What it controls | Defaults |
+|---|---|---|
+| `domain` | Which named features to build; their parameters | all 9; `school_premium_scale: 3`, `top_school_threshold: 8.5`, `new_build_max_age: 5` |
+| `generators` | Pairwise interactions, polynomial expansion, binning (each toggled on/off, with columns) | off in the base pipeline; compared as candidates |
+| `numeric_transform` | `log` / `yeo-johnson` / `box-cox` / `none` for skewed features | `log` |
+| `encoding` | `onehot` / `frequency` / `target` / `hash`, smoothing, hash width | `onehot` |
+| `imputation` | `median` / `mean` / `knn`, k, missing-value indicator columns | `median`, no indicators |
+| `temporal` | Date columns, reference date, which time features | none (no dates in this data) |
+| `selection` | **Every threshold behind each technique's vote** | MI ≥ 0.01, \|ρ\| ≥ 0.9, Lasso ≥ 80% of folds, permutation > 0.2% of mean price, consensus ≥ 3 votes |
+| `decision` | Significance level, minimum gain, tie tolerance, which candidates to compare | α = 0.05, gain ≥ 0.5%, tie ≤ 0.5% |
+| `profiling`, `compute` | Step timing, memory tracing, cProfile, parallel jobs | timing on, memory off, `n_jobs: -1` |
+
+### Domain features
 
 | Feature | Formula | Domain rationale |
 |---|---|---|
-| `school_premium` | exp(school / 3) | Buyers pay disproportionately more for the best school catchments. A diagnostic run for this stage showed that almost all of Stage 5's spline gain comes from curvature in the school effect (splines on school alone recover $2,467 of the $2,592 gain) |
-| `school_squared` | school² | Simpler encoding of the same curvature; included so selection can choose between them |
+| `school_premium` | exp(school / 3) | Buyers pay disproportionately more for the best catchments. A diagnostic run showed almost all of Stage 5's spline gain comes from curvature in the school effect (splines on school alone recover $2,467 of the $2,592 gain) |
+| `school_squared` | school² | Simpler encoding of the same curvature, so selection can choose between them |
 | `neighbourhood_quality` | log(school / crime) | Good schools and low crime describe one thing to a buyer: a desirable area |
 | `size_per_bedroom` | size / bedrooms (logged) | Spaciousness: larger rooms signal a higher-end home |
 | `bath_per_bed` | bathrooms / bedrooms | En-suite ratio, a common luxury indicator |
-| `total_rooms` | bedrooms + bathrooms | Overall size in rooms, a standard listing figure |
+| `total_rooms` | bedrooms + bathrooms | Overall size in rooms |
 | `school_x_size` | school × log(size) | Families buying large homes may value schools more |
 | `top_school` | 1 if school ≥ 8.5 | Step premium for top-rated catchments |
 | `new_build` | 1 if age < 5 | New-build premium |
 
-**Engineering pitfall found and handled:** Stage 2's IQR outlier capper collapses to [0, 0] for a mostly-zero 0/1
-column and silently erased the two flags in a first test (they changed the model by exactly $0). Binary features now
-bypass the capper and are only imputed.
+Division by zero and logs of non-positive values return NaN (then imputed), never `inf`; tests cover each case.
+**Pitfall found and fixed:** Stage 2's IQR outlier capper collapses to [0, 0] for a mostly-zero 0/1 column and erased
+the two flags in a first test. Binary features and missing-value indicators now bypass the capper (regression test
+included).
 
-### Feature selection: five techniques
+### Generic generators, transforms, encodings and imputation: tested as candidates
 
-All run on the training set only, on the processed design matrix (log target). Each casts a keep/drop vote:
+Instead of hand-picking only, the generic options are compared on the same 15 paired folds as everything else:
 
-| Technique | Type | Keep rule |
+| Option (Ridge, all else Stage 2) | CV RMSE | vs original | Verdict |
+|---|---|---|---|
+| Polynomial (school², size², degree 2) | $34,115 | −3.9% | Helps, but less than the named domain features |
+| Pairwise interactions (size, school, crime, age) | $34,500 | −2.8% | Helps a little; 6 extra columns |
+| Binning school into 5 quantile bins | $34,595 | −2.5% | Helps a little |
+| Target encoding (cross-fitted) | $35,422 | −0.2% | Below the 0.5% minimum gain: one-hot kept |
+| Frequency encoding | $35,433 | −0.1% | Below the minimum gain |
+| KNN imputation + missing indicators | $35,481 | 0.0% | No effect: this dataset has no missing values |
+| Box-Cox | $37,049 | **+4.4%** | Worse than log |
+| Yeo-Johnson | $37,066 | **+4.5%** | Worse than log |
+
+Why the power transforms lose: they choose the exponent that makes each feature *look normal*, whereas the log is right
+because the price relationship is *multiplicative* (log-log, as the EDA found). Making features normal is not the goal;
+making them linear in log price is.
+
+### Choosing an encoding (beyond this dataset)
+
+`location_type` has 3 levels, so one-hot is the right choice here. For other data, `encoding.method` switches strategy:
+
+| Situation | Encoding | Why |
 |---|---|---|
-| Mutual information | Filter (univariate relevance) | MI ≥ 0.01 |
-| Spearman redundancy | Filter (redundancy) | Not the weaker member of a pair with \|ρ\| ≥ 0.9 |
-| Lasso stability | Embedded | Non-zero LassoCV coefficient in ≥ 80% of the 15 CV folds |
-| RFECV with Ridge | Wrapper | Kept by recursive elimination with 5-fold CV |
-| Permutation importance (gradient boosting) | Model-agnostic | Shuffling raises RMSE by > 0.2% of mean price |
+| Few levels (< ~15) | `onehot` | Exact, interpretable, no information loss |
+| Many levels, frequency is meaningful (e.g. 300 suburbs) | `frequency` | One column; no target leakage; unseen → 0 |
+| Many levels, strong level-specific price effects | `target` | One column per feature; **cross-fitted** (each row encoded without its own price), smoothed toward the global mean for rare levels; tested for leakage |
+| Very high or open-ended cardinality (street names, agents) | `hash` | Fixed width, no vocabulary to store; collisions are the trade-off |
+
+### Temporal features: not applicable here, designed for when they are
+
+This dataset has **no date or time column** (no sale date, listing date or construction date; `age_of_property` is
+already a duration), so no temporal features are built. The pipeline is ready for data that has them:
+- `TemporalFeatureGenerator` (enabled by `temporal.date_columns`) creates `days_since` (against a reference date fixed
+  at fit time, so new data is on the same scale), `month`, `quarter`, `dayofweek`, `is_weekend`. With no date columns
+  it is a documented no-op.
+- `past_rolling_mean(df, date, group, value, window)` computes grouped trends such as "average sale price in this
+  neighbourhood over the past 365 days" using **only strictly earlier rows**, so the current or future sales never leak
+  into a feature. Time-since-last-event follows the same pattern (`groupby(...).diff()` after sorting by date).
+- With dated data, CV should also become time-ordered (train on the past, validate on the future) rather than shuffled.
+
+Both pieces are unit-tested on synthetic dates.
+
+### Missing values
+
+Stage 2 imputes with the median and the dataset has no missing values. Options now include `mean` and `knn`
+(`KNNImputer`, k configurable) and **missing-value indicator columns**, which let a model learn whether missingness
+itself predicts price. All strategies are validated against an allowed list, and a test checks every combination
+produces finite output on data with missing values, zero denominators and unseen categories.
+
+### Feature selection: five techniques, configurable thresholds
+
+| Technique | Type | Keep rule (config key) |
+|---|---|---|
+| Mutual information | Filter | MI ≥ `selection.mutual_info_min` (0.01) |
+| Spearman redundancy | Filter | Not the weaker member of a pair with \|ρ\| ≥ `selection.redundancy_corr` (0.9) |
+| Lasso stability | Embedded | Non-zero in ≥ `selection.lasso_keep_share` (80%) of the 15 CV folds |
+| RFECV with Ridge | Wrapper | Kept by recursive elimination (`rfecv_min_features`, `rfecv_step`, `rfecv_folds`) |
+| Permutation importance (gradient boosting) | Model-agnostic | RMSE rise > `selection.permutation_min_share` (0.2%) of mean price |
 
 ![Selection votes](docs/fe_selection_votes.png)
 
-What the techniques show:
-- **Redundancy is real.** The school encodings are rank-identical to the raw score (ρ = 1.0), `total_rooms` overlaps
-  bedrooms (0.93) and bathrooms (0.92), and `neighbourhood_quality` overlaps crime (0.96).
-- **Techniques disagree for good reasons.** Permutation importance gives `school_premium`/`school_squared` zero,
-  because a tree treats any monotonic transform of school as the same feature. Lasso and RFECV keep them, because a
-  linear model *can* only use the curvature if it is given as a feature.
-- **Two ideas fail:** `top_school` and `new_build` get only 2 of 5 votes (the effects are smooth, not steps), and
-  `size_per_bedroom` adds nothing once size and rooms are known.
+- **Redundancy is real:** the school encodings are rank-identical to the raw score (ρ = 1.0), `total_rooms` overlaps
+  bedrooms (0.93) and bathrooms (0.92), `neighbourhood_quality` overlaps crime (0.96).
+- **Techniques disagree for good reasons:** permutation importance gives `school_premium` zero because a tree treats any
+  monotonic transform of school as the same feature; Lasso and RFECV keep it because a linear model can only use the
+  curvature if it is given as a feature.
+- **Two ideas fail:** `top_school` and `new_build` (2 of 5 votes; the effects are smooth, not steps).
+- **Stability:** a test re-runs selection with the same seed and requires an identical result.
 
-### Comparing feature sets
-
-Six candidate sets, built from the votes, were compared with the Ridge benchmark on **the same 15 paired folds as
-Stage 3**, with gradient boosting as a check that the gain is not specific to linear models:
+### Comparing feature sets and the decision
 
 ![Feature-set comparison](docs/fe_feature_sets.png)
 
@@ -278,37 +372,63 @@ Stage 3**, with gradient boosting as a check that the gain is not specific to li
 | Consensus (≥ 3 of 5 votes) | 11 | $33,480 | −5.6% | 14/15 | 0.0001 |
 | Redundancy-pruned | 11 | $34,135 | −3.8% | 12/15 | 0.01 |
 
-**Selection rule** (in `choose_feature_set`, fixed before the comparison): a set must beat the original features on the
-paired folds (p < 0.05) by at least 0.5%; among those, the sets within 0.5% of the best are tied and the one with fewest
-features wins. RFECV was best by more than 0.5%, so no tie applied.
-
-**Selected: the original 8 features + `school_premium`, `school_squared`, `neighbourhood_quality`, `total_rooms`,
-`school_x_size`.**
+**Rule** (`decision` in the config): beat the original features on the paired folds (p < 0.05) by ≥ 0.5%; among those,
+sets within 0.5% of the best are tied and the fewest features wins. **Selected: the original 8 features +
+`school_premium`, `school_squared`, `neighbourhood_quality`, `total_rooms`, `school_x_size`.**
 
 | Held-out test set (Ridge) | RMSE | MAE | MAPE | R² |
 |---|---|---|---|---|
 | Original features | $37,783 | $26,411 | 7.12% | 0.911 |
 | **Selected features** | **$36,559** | **$25,178** | **6.74%** | **0.917** |
 
-### What it means
-1. **Domain features help.** The Ridge benchmark improves by 9% in CV and 3.2% on the test set, and gradient boosting
-   also improves (−4.0% CV RMSE with all engineered features), so the gain is not a linear-model artefact.
-2. **It is the same signal Stage 5 found, now with names.** The engineered Ridge (CV $32,292) matches the Stage 5
-   spline Ridge (CV $32,391): both capture the curved school effect. Here it is expressed as features a buyer or
-   valuer can understand ("school premium", "neighbourhood quality") instead of spline basis functions.
-3. **More features ≠ better.** Adding all nine is worse than the RFECV subset, and the pruned sets that removed the
-   original school/crime columns lost accuracy: the engineered features complement the raw ones rather than replace them.
-4. **Caveat:** the selected set keeps three highly correlated school encodings. Ridge's penalty handles the collinearity
-   for prediction, but individual coefficients of those three should not be interpreted on their own.
+Gradient boosting also improves with the engineered features (−4.0% CV RMSE), so the gain is not a linear-model
+artefact. The engineered Ridge (CV $32,292) matches Stage 5's spline Ridge ($32,391) using named, explainable
+features. Caveat: the selected set keeps three correlated school encodings; Ridge's penalty handles that for prediction,
+but their individual coefficients should not be interpreted alone.
 
-**How this relates to Stages 3–5:** those stages were built and reported on the original 8 features, and their results are
-kept unchanged so they stay comparable with each other. The Stage 5 final model (`ridge_splines`) already captures the
-same curvature, so its conclusion stands. For a next iteration, the selected feature set can be plugged into any model with
-`make_fe_model(regressor, engineered=[...])`.
+### Profiling and the decisions it drove
 
-Outputs in `artifacts/features/`: `engineered_feature_catalogue.csv` (formulas and rationale),
-`feature_selection_scores.csv` (all techniques and votes), `redundant_pairs.csv`, `feature_set_comparison.csv`,
-`feature_set_cv_folds.csv`, `feature_set_test.csv`, `selected_features.json` (decision, rule, selected set) and plots.
+`src/profiling.py` records wall time, CPU time and (optionally) peak memory for every step; results are saved to
+`artifacts/features/profile.csv`. `profiling.cprofile_top: 25` also saves a function-level cProfile report.
+
+| Step | Wall time (before) | Wall time (after) | Peak memory |
+|---|---|---|---|
+| Design matrix, MI, redundancy | 0.2 s | 0.2 s | < 1 MB |
+| Lasso stability (15 × LassoCV) | 1.7 s | 1.9 s | 1.1 MB |
+| RFECV | 1.5 s | 1.7 s | 0.9 MB |
+| Permutation importance | 1.4 s | 1.3 s | 3.8 MB |
+| **Comparison: 14 Ridge sets × 15 folds** | **17.4 s** | **8.8 s** | 1.5 MB |
+| **Comparison: gradient-boosting check** | **17.9 s** | **7.9 s** | 2.3 MB |
+| **Whole stage** | **40 s** | **23 s** | — |
+
+(2-core reference machine; faster on more cores.)
+
+1. **Memory is not a constraint:** the largest step peaks below 4 MB.
+2. **Memory tracing is expensive:** with `tracemalloc` on, the stage took 143 s instead of 40 s (3.6× slower), so it is
+   now `profiling.track_memory: false` by default and run once on demand.
+3. **The comparison dominated (88% of the time) and is embarrassingly parallel**, so its (model, fold) fits now run in
+   parallel (`compute.n_jobs`), cutting it 2.1× (35 s → 17 s). A test checks the parallel results equal the sequential ones exactly.
+4. Lasso stability and RFECV were already parallel inside scikit-learn and are small, so they were left alone.
+
+### Testing and code quality tooling
+
+| Layer | Tool | What it enforces |
+|---|---|---|
+| Unit tests | `pytest` (65 tests, `tests/`) | Engineered feature values and shapes; zero denominators → NaN not inf; deterministic feature names; thresholds read from config; generators, power transforms, Box-Cox error; frequency/hash encoders; **target-encoding leakage check**; temporal no-op, fixed reference date, past-only rolling mean; binary flags survive capping; every config option on dirty data; selection stability, vote thresholds, tie-break rule; parallel = sequential CV; config validation (20 invalid cases); profiler |
+| Lint | `ruff` (`pyproject.toml`) | pycodestyle, pyflakes, import order, bugbear, pyupgrade, simplify; whole repo passes |
+| Types | `mypy` | Feature-engineering layer (`fe_config`, `feature_engineering`, `feature_selection`, `profiling`) passes with `check_untyped_defs` |
+| Pre-commit | `.pre-commit-config.yaml` | ruff, mypy, pytest and file hygiene run on every commit (`pip install pre-commit && pre-commit install`) |
+| CI | `.github/workflows/ci.yml` | Lint, type check, tests and config validation on every push |
+
+### Outputs (`artifacts/features/`)
+`fe_config_used.json`, `engineered_feature_catalogue.csv`, `feature_selection_scores.csv` (all techniques and votes),
+`redundant_pairs.csv`, `feature_set_comparison.csv`, `feature_set_cv_folds.csv`, `feature_set_test.csv`,
+`selected_features.json` (decision, rule, selected set), `profile.csv`, plots.
+
+**How this relates to Stages 3–5:** those stages were built and reported on the original 8 features and are kept unchanged
+so they stay comparable with each other. The Stage 5 final model already captures the same curvature, so its conclusion
+stands; the selected feature set can be plugged into any model with
+`make_fe_model(regressor, fe=..., engineered=[...])`.
 
 ## Baseline model
 

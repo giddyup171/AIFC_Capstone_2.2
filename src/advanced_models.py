@@ -222,8 +222,12 @@ def timing_table(models: dict[str, Pipeline], X_train, y_train, X_test, repeats:
         fit_t, pred_t = [], []
         for _ in range(repeats):
             m = clone(model)
-            t0 = time.perf_counter(); m.fit(X_train, y_train); fit_t.append(time.perf_counter() - t0)
-            t0 = time.perf_counter(); m.predict(X_test); pred_t.append(time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            m.fit(X_train, y_train)
+            fit_t.append(time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            m.predict(X_test)
+            pred_t.append(time.perf_counter() - t0)
         rows.append({"model": name, "fit_seconds": float(np.median(fit_t)),
                      "predict_ms_per_1000_rows": float(np.median(pred_t) * 1000 * 1000 / len(X_test))})
     return pd.DataFrame(rows).set_index("model")

@@ -32,8 +32,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -66,7 +67,8 @@ P = "model__regressor__"
 
 OPTIMISED_DESCRIPTIONS = {
     "ridge_splines": "Ridge on log target with cubic spline expansion of numeric features (tuned knots/degree)",
-    "gradient_boosting_opt": "Gradient boosting with a regularisation-focused search (shallow trees, big leaves, L2, early stopping)",
+    "gradient_boosting_opt": ("Gradient boosting with a regularisation-focused search "
+                              "(shallow trees, big leaves, L2, early stopping)"),
     "neural_network_opt": "MLP tuned on one seed, deployed as an average of 5 networks from different seeds",
 }
 
@@ -430,7 +432,7 @@ def plot_before_after(nested: pd.DataFrame, path) -> None:
              ("Neural network", "neural_network", "neural_network_opt")]
     fig, ax = plt.subplots(figsize=(9, 4.2))
     y = np.arange(len(pairs))
-    for i, (label, before, after) in enumerate(pairs):
+    for i, (_label, before, after) in enumerate(pairs):
         for off, m, txt in [(0.2, before, "before"), (-0.2, after, "after")]:
             if m in nested.index:
                 v, s = nested.loc[m, "mean"], nested.loc[m, "std"]

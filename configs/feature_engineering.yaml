@@ -1,0 +1,82 @@
+# Feature engineering & selection configuration (Stage 2b).
+# Every threshold that drives a decision lives here; src/fe_config.py validates it on load.
+# Run: python main.py --stage features --fe-config configs/feature_engineering.yaml
+
+# --- Domain features (src/feature_engineering.FEATURE_CATALOGUE) -------------------------
+domain:
+  # Which catalogue features to build. Remove a name to switch it off.
+  features: [school_premium, school_squared, neighbourhood_quality, size_per_bedroom, bath_per_bed,
+             total_rooms, school_x_size, top_school, new_build]
+  school_premium_scale: 3.0      # school_premium = exp(school / scale); smaller = steeper premium
+  top_school_threshold: 8.5      # top_school = 1 if school >= threshold
+  new_build_max_age: 5           # new_build = 1 if age < this
+
+# --- Generic, toggle-driven generators ---------------------------------------------------
+# Applied to numeric columns after imputation and the numeric transform, before scaling.
+generators:
+  interactions:
+    enabled: false
+    columns: [property_size, school_quality_score, crime_rate_in_area, age_of_property]   # or "all"
+  polynomial:
+    enabled: false
+    columns: [school_quality_score, property_size]
+    degree: 2
+  binning:
+    enabled: false
+    columns: [school_quality_score]
+    n_bins: 5
+    strategy: quantile           # quantile | uniform | kmeans
+
+# Transform for skewed numeric features (the Stage 2 log list). Box-Cox needs strictly positive data.
+numeric_transform: log           # log | yeo-johnson | box-cox | none
+
+# --- Categorical encoding -----------------------------------------------------------------
+encoding:
+  method: onehot                 # onehot | frequency | target | hash
+  hash_n_features: 8             # for method: hash
+  target_smoothing: auto         # for method: target ("auto" or a number); cross-fitted, leakage-safe
+
+# --- Missing values ---------------------------------------------------------------------------
+imputation:
+  numeric_strategy: median       # median | mean | knn
+  knn_neighbors: 5
+  add_missing_indicator: false   # adds a 0/1 column per numeric feature (bypasses outlier capping)
+
+# --- Temporal features (not applicable to this dataset: no date columns) -------------------
+temporal:
+  date_columns: []               # e.g. [sale_date]; empty = generator is a documented no-op
+  reference_date: null           # "YYYY-MM-DD"; default = latest date in the training data
+  features: [days_since, month, quarter, is_weekend]
+
+# --- Feature selection: thresholds behind each technique's keep/drop vote ------------------
+selection:
+  mutual_info_min: 0.01          # filter: keep if MI with log price >= this
+  redundancy_corr: 0.9           # redundancy: |Spearman| at or above this marks a redundant pair
+  lasso_keep_share: 0.8          # embedded: keep if non-zero in >= this share of CV folds
+  lasso_inner_folds: 5
+  rfecv_min_features: 3          # wrapper
+  rfecv_step: 1
+  rfecv_folds: 5
+  permutation_min_share: 0.002   # model-agnostic: keep if RMSE rises by > this share of mean price
+  permutation_repeats: 5
+  permutation_holdout: 0.25
+  consensus_min_votes: 3         # consensus candidate set: features with at least this many keep votes
+
+# --- Choosing between candidate feature sets -------------------------------------------------
+decision:
+  alpha: 0.05                    # paired t-test significance vs original features
+  min_gain: 0.005                # must cut CV RMSE by at least 0.5%
+  tie_tolerance: 0.005           # sets within 0.5% of the best are tied -> fewest features wins
+  include_generic_candidates: true    # also compare interactions / polynomial / binning / transforms /
+                                      # encodings / imputation variants as candidate sets
+  include_gradient_boosting_check: true
+
+# --- Profiling --------------------------------------------------------------------------------
+profiling:
+  enabled: true                  # step-level wall time and CPU time per step
+  track_memory: false            # peak memory via tracemalloc; measured 3.6x slowdown, so off by default
+  cprofile_top: 0                # > 0: also save the top-N functions by cumulative time (cProfile)
+
+# --- Compute -----------------------------------------------------------------------------------
+compute:
+  n_jobs: -1                     # parallel CV fits in the feature-set comparison (-1 = all cores)

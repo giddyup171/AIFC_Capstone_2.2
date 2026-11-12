@@ -1,0 +1,7 @@
+# Development tooling (not needed to run the pipeline)
+pytest>=8.0
+ruff>=0.6
+mypy>=1.11
+pandas-stubs>=2.2
+types-PyYAML>=6.0
+pre-commit>=3.7

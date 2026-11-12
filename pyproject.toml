@@ -1,0 +1,41 @@
+[project]
+name = "house-price-regression"
+version = "1.1.0"
+description = "House sale price regression: EDA, preprocessing, feature engineering, modelling and optimisation"
+requires-python = ">=3.10"
+
+# ---------------------------------------------------------------- tests
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning", "ignore::UserWarning"]
+
+# ---------------------------------------------------------------- lint + format
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["*.ipynb", "artifacts"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I import order, B bugbear, UP pyupgrade, SIM simplify
+select = ["E", "W", "F", "I", "B", "UP", "SIM"]
+ignore = [
+    "E731",   # small named lambdas are used deliberately for formatters
+    "B905",   # zip() without strict= is fine for equal-length columns built together
+    "SIM108", # ternaries are not always clearer
+]
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = ["E402"]   # matplotlib.use("Agg") must run before pyplot-importing modules
+
+# ---------------------------------------------------------------- static types
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+# Strict checking for the feature-engineering layer added in Stage 2b
+files = ["src/fe_config.py", "src/feature_engineering.py", "src/feature_selection.py", "src/profiling.py"]
