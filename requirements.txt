@@ -1,0 +1,20 @@
+# Core data analysis
+pandas>=2.2
+numpy>=1.26
+scipy>=1.11
+
+# Visualisation
+matplotlib>=3.8
+seaborn>=0.13
+
+# Statistics & modelling diagnostics
+scikit-learn>=1.4
+statsmodels>=0.14
+
+# Notebook support (VS Code Jupyter extension uses ipykernel)
+ipykernel>=6.29
+jupyter>=1.0
+nbformat>=5.9
+
+# Pipeline persistence
+joblib>=1.3
